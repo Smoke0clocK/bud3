@@ -1,0 +1,8 @@
+[0;1;32m●[0m postgresql.service - PostgreSQL RDBMS
+     Loaded: loaded (]8;;file://budeserver-ubuntu-s-1vcpu-1gb-35gb-intel-sfo3-01/usr/lib/systemd/system/postgresql.service/usr/lib/systemd/system/postgresql.service]8;;; [0;1;32menabled[0m; preset: [0;1;32menabled[0m)
+     Active: [0;1;32mactive (exited)[0m since Wed 2024-12-11 08:25:50 UTC; 9min ago
+   Main PID: 219927 (code=exited, status=0/SUCCESS)
+        CPU: 3ms
+
+Dec 11 08:25:50 budeserver-ubuntu-s-1vcpu-1gb-35gb-intel-sfo3-01 systemd[1]: Starting postgresql.service - PostgreSQL RDBMS...
+Dec 11 08:25:50 budeserver-ubuntu-s-1vcpu-1gb-35gb-intel-sfo3-01 systemd[1]: Finished postgresql.service - PostgreSQL RDBMS.

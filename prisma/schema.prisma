@@ -1,0 +1,39 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Channel {
+  id          String   @id @default(cuid())
+  platform    String   // discord, telegram, etc
+  channelId   String   // platform-specific channel ID
+  name        String?
+  bridgeId    String   // group channels that bridge together
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  messages    Message[]
+
+  @@unique([platform, channelId])
+}
+
+model Message {
+  id          String    @id @default(cuid())
+  content     String
+  platform    String
+  platformId  String    // original message ID from platform
+  channelId   String
+  channel     Channel   @relation(fields: [channelId], references: [id])
+  authorId    String
+  authorName  String
+  createdAt   DateTime  @default(now())
+  editedAt    DateTime?
+  threadId    String?
+  replyToId   String?
+  attachments Json?     // store URLs and metadata
+
+  @@unique([platform, platformId])
+}
