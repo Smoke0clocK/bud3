@@ -1,7 +1,7 @@
 'use client';
 
 import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
-import { Client, GatewayIntentBits, Message, TextChannel } from 'discord.js';
+import { Client, GatewayIntentBits, Message, TextChannel, MessageReaction } from 'discord.js';
 import { PrismaService } from '../services/prisma.service';
 import { ConfigService } from '@nestjs/config';
 import { MessageBrokerService } from '../services/message-broker.service';
@@ -22,13 +22,22 @@ export class DiscordService implements OnModuleInit {
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMessageReactions,
       ],
     });
   }
 
   async onModuleInit() {
     try {
+      // Message handling
       this.client.on('messageCreate', (msg) => this.handleMessage(msg));
+      
+      // Message deletion
+      this.client.on('messageDelete', (msg) => this.handleMessageDelete(msg));
+      
+      // Message editing
+      this.client.on('messageUpdate', (oldMsg, newMsg) => this.handleMessageEdit(oldMsg, newMsg));
+
       await this.client.login(this.config.get('DISCORD_TOKEN'));
       this.logger.log('Discord bot is online!');
 
@@ -43,7 +52,7 @@ export class DiscordService implements OnModuleInit {
   }
 
   private async handleMessage(msg: Message) {
-    if (msg.author.bot) return;
+    if (msg.author.bot && !msg.webhookId) return;
 
     const channel = await this.prisma.channel.findUnique({
       where: {
@@ -62,20 +71,24 @@ export class DiscordService implements OnModuleInit {
       let messageContent = msg.content;
       let replyData = null;
 
-      // Handle reply chains
+      // Handle replies
       if (msg.reference?.messageId) {
-        const repliedMessage = await msg.channel.messages.fetch(msg.reference.messageId);
-        if (repliedMessage) {
-          const repliedAuthor = repliedMessage.member?.displayName || repliedMessage.author.username;
-          replyData = {
-            authorName: repliedAuthor,
-            content: repliedMessage.content,
-            messageId: repliedMessage.id
-          };
+        try {
+          const repliedMessage = await msg.channel.messages.fetch(msg.reference.messageId);
+          if (repliedMessage) {
+            const repliedAuthor = repliedMessage.member?.displayName || repliedMessage.author.username;
+            replyData = {
+              messageId: repliedMessage.id,
+              authorName: repliedAuthor,
+              content: repliedMessage.content
+            };
+          }
+        } catch (error) {
+          this.logger.error('Failed to fetch reply message:', error);
         }
       }
 
-      // Store message
+      // Store message in database
       const stored = await this.prisma.message.create({
         data: {
           platform: 'discord',
@@ -87,12 +100,13 @@ export class DiscordService implements OnModuleInit {
           authorAvatar: avatarUrl,
           threadId: msg.thread?.id || null,
           replyToId: msg.reference?.messageId || null,
+          replyData: replyData ? JSON.stringify(replyData) : null,
           attachments: msg.attachments.size > 0 ? 
             JSON.stringify(Array.from(msg.attachments.values())) : null
         },
       });
 
-      // Handle media attachments
+      // Handle attachments
       const mediaAttachments = [];
       if (msg.attachments.size > 0) {
         for (const [_, attachment] of msg.attachments) {
@@ -119,7 +133,7 @@ export class DiscordService implements OnModuleInit {
         }
       }
 
-      // Publish message
+      // Publish to broker
       this.broker.publish({
         content: messageContent,
         platform: 'discord',
@@ -134,6 +148,64 @@ export class DiscordService implements OnModuleInit {
     }
   }
 
+  private async handleMessageDelete(msg: Message) {
+    try {
+      // Find the message in our database
+      const storedMessage = await this.prisma.message.findFirst({
+        where: {
+          platform: 'discord',
+          platformId: msg.id
+        }
+      });
+
+      if (storedMessage) {
+        // Delete from database
+        await this.prisma.message.delete({
+          where: {
+            id: storedMessage.id
+          }
+        });
+
+        // Notify broker about deletion
+        this.broker.publish({
+          platform: 'discord',
+          channelId: msg.channelId,
+          action: 'delete',
+          messageId: msg.id
+        });
+      }
+    } catch (error) {
+      this.logger.error('Failed to handle message deletion:', error);
+    }
+  }
+
+  private async handleMessageEdit(oldMsg: Message, newMsg: Message) {
+    try {
+      // Update in database
+      await this.prisma.message.updateMany({
+        where: {
+          platform: 'discord',
+          platformId: newMsg.id
+        },
+        data: {
+          content: newMsg.content,
+          editedAt: new Date()
+        }
+      });
+
+      // Notify broker about edit
+      this.broker.publish({
+        platform: 'discord',
+        channelId: newMsg.channelId,
+        action: 'edit',
+        messageId: newMsg.id,
+        content: newMsg.content
+      });
+    } catch (error) {
+      this.logger.error('Failed to handle message edit:', error);
+    }
+  }
+
   private async handleTelegramMessage(message: any) {
     try {
       const pair = await this.getChannelPair(message);
@@ -142,35 +214,66 @@ export class DiscordService implements OnModuleInit {
       const channel = await this.client.channels.fetch(pair.discordChannel.channelId);
       if (!(channel instanceof TextChannel)) return;
 
-      const content = `${message.authorName}: ${message.content}`;
+      // Format message to look native to Discord
+      const content = `**${message.authorName}** ${message.content}`;
 
       if (message.attachments) {
-        const attachments = JSON.parse(message.attachments);
-        await this.sendMediaToDiscord(channel, content, attachments);
+        await this.handleIncomingMedia(channel, content, message);
       } else {
-        await channel.send(content);
+        const options: any = {};
+        
+        // Handle replies
+        if (message.replyData) {
+          const replyInfo = JSON.parse(message.replyData);
+          const repliedMessage = await this.prisma.message.findFirst({
+            where: {
+              platform: 'discord',
+              channelId: channel.id,
+              platformId: replyInfo.messageId
+            }
+          });
+
+          if (repliedMessage) {
+            options.reply = { messageReference: repliedMessage.platformId };
+          }
+        }
+
+        await channel.send({ content, ...options });
       }
     } catch (error) {
       this.logger.error('Failed to send message:', error);
     }
   }
 
-  private async sendMediaToDiscord(channel: TextChannel, content: string, attachments: any) {
+  private async handleIncomingMedia(channel: TextChannel, content: string, message: any) {
     try {
-      for (const attachment of Array.isArray(attachments) ? attachments : [attachments]) {
-        const response = await axios.get(attachment.url, { responseType: 'arraybuffer' });
-        const buffer = Buffer.from(response.data);
+      const attachments = JSON.parse(message.attachments);
+      const attachmentArray = Array.isArray(attachments) ? attachments : [attachments];
 
-        await channel.send({
-          content,
-          files: [{
-            attachment: buffer,
-            name: attachment.name || `file.${this.getExtensionFromType(attachment.contentType)}`
-          }]
-        });
+      for (const attachment of attachmentArray) {
+        if (!attachment.url) continue;
+
+        try {
+          const response = await axios.get(attachment.url, { responseType: 'arraybuffer' });
+          const buffer = Buffer.from(response.data);
+
+          await channel.send({
+            content,
+            files: [{
+              attachment: buffer,
+              name: attachment.name || 'media'
+            }]
+          });
+        } catch (error) {
+          this.logger.error('Failed to handle media attachment:', error);
+          // Send text-only message as fallback
+          await channel.send(content);
+        }
       }
     } catch (error) {
-      this.logger.error('Failed to send media:', error);
+      this.logger.error('Failed to handle media message:', error);
+      // Send text-only message as fallback
+      await channel.send(content);
     }
   }
 
@@ -186,18 +289,6 @@ export class DiscordService implements OnModuleInit {
       mov: 'video/quicktime'
     };
     return mimeTypes[ext] || 'application/octet-stream';
-  }
-
-  private getExtensionFromType(contentType: string): string {
-    const types = {
-      'image/png': 'png',
-      'image/jpeg': 'jpg',
-      'image/gif': 'gif',
-      'image/webp': 'webp',
-      'video/mp4': 'mp4',
-      'video/quicktime': 'mov'
-    };
-    return types[contentType] || 'bin';
   }
 
   private async getChannelPair(message: any) {
