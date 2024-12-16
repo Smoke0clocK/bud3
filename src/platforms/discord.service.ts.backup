@@ -24,6 +24,11 @@ export class DiscordService implements OnModuleInit {
         GatewayIntentBits.MessageContent,
       ],
     });
+
+    // Simple error handling
+    this.client.on('error', error => {
+      this.logger.error('Discord client error:', error);
+    });
   }
 
   async onModuleInit() {
@@ -57,30 +62,16 @@ export class DiscordService implements OnModuleInit {
     if (!channel) return;
 
     try {
+      // Get actual display name and avatar
       const displayName = msg.member?.displayName || msg.author.username;
-      const avatarUrl = msg.author.displayAvatarURL({ extension: 'png', size: 128 });
-      let messageContent = msg.content;
-      let replyData = null;
+      const avatarUrl = msg.author.displayAvatarURL({ format: 'png', size: 128 });
 
-      // Handle reply chains
-      if (msg.reference?.messageId) {
-        const repliedMessage = await msg.channel.messages.fetch(msg.reference.messageId);
-        if (repliedMessage) {
-          const repliedAuthor = repliedMessage.member?.displayName || repliedMessage.author.username;
-          replyData = {
-            authorName: repliedAuthor,
-            content: repliedMessage.content,
-            messageId: repliedMessage.id
-          };
-        }
-      }
-
-      // Store message
+      // Store message with enhanced user info
       const stored = await this.prisma.message.create({
         data: {
           platform: 'discord',
           platformId: msg.id,
-          content: messageContent,
+          content: msg.content,
           channelId: channel.id,
           authorId: msg.author.id,
           authorName: displayName,
@@ -88,49 +79,82 @@ export class DiscordService implements OnModuleInit {
           threadId: msg.thread?.id || null,
           replyToId: msg.reference?.messageId || null,
           attachments: msg.attachments.size > 0 ? 
-            JSON.stringify(Array.from(msg.attachments.values())) : null
+            JSON.stringify(Array.from(msg.attachments.values())) : null,
         },
       });
 
-      // Handle media attachments
-      const mediaAttachments = [];
-      if (msg.attachments.size > 0) {
-        for (const [_, attachment] of msg.attachments) {
-          mediaAttachments.push({
+      // Handle reply content
+      let replyContent = '';
+      if (msg.reference?.messageId) {
+        const repliedMessage = await msg.channel.messages.fetch(msg.reference.messageId);
+        if (repliedMessage) {
+          const repliedAuthor = repliedMessage.member?.displayName || repliedMessage.author.username;
+          replyContent = `Replying to ${repliedAuthor}:\n"${repliedMessage.content}"\n\n`;
+        }
+      }
+
+      // Publish to broker with enhanced user info
+      this.broker.publish({
+        content: replyContent + msg.content,
+        platform: 'discord',
+        channelId: msg.channelId,
+        authorName: displayName,
+        authorAvatar: avatarUrl,
+        attachments: msg.attachments.size > 0 ? 
+          JSON.stringify(Array.from(msg.attachments.values())) : null,
+        replyToId: msg.reference?.messageId
+      });
+
+      // Handle media separately
+      if (msg.attachments.size > 0 || msg.stickers.size > 0) {
+        await this.handleMediaMessage(msg, displayName, avatarUrl);
+      }
+    } catch (error) {
+      this.logger.error('Failed to process message:', error);
+    }
+  }
+
+  private async handleMediaMessage(msg: Message, displayName: string, avatarUrl: string) {
+    try {
+      // Handle attachments
+      for (const [_, attachment] of msg.attachments) {
+        this.broker.publish({
+          content: msg.content,
+          platform: 'discord',
+          channelId: msg.channelId,
+          authorName: displayName,
+          authorAvatar: avatarUrl,
+          attachments: JSON.stringify({
             url: attachment.url,
-            contentType: attachment.contentType || this.getContentType(attachment.name),
+            contentType: attachment.contentType,
             name: attachment.name,
             width: attachment.width,
             height: attachment.height
-          });
-        }
+          })
+        });
       }
 
       // Handle stickers
       if (msg.stickers.size > 0) {
         for (const sticker of msg.stickers.values()) {
-          mediaAttachments.push({
-            url: sticker.url,
-            contentType: `image/${sticker.format === 2 ? 'gif' : 'png'}`,
-            isSticker: true,
-            isAnimated: sticker.format === 2,
-            name: sticker.name
+          this.broker.publish({
+            content: sticker.name,
+            platform: 'discord',
+            channelId: msg.channelId,
+            authorName: displayName,
+            authorAvatar: avatarUrl,
+            attachments: JSON.stringify({
+              url: sticker.url,
+              contentType: 'image/' + (sticker.format === 2 ? 'gif' : 'png'),
+              isSticker: true,
+              isAnimated: sticker.format === 2,
+              name: sticker.name
+            })
           });
         }
       }
-
-      // Publish message
-      this.broker.publish({
-        content: messageContent,
-        platform: 'discord',
-        channelId: msg.channelId,
-        authorName: displayName,
-        authorAvatar: avatarUrl,
-        attachments: mediaAttachments.length > 0 ? JSON.stringify(mediaAttachments) : null,
-        replyData: replyData ? JSON.stringify(replyData) : null
-      });
     } catch (error) {
-      this.logger.error('Failed to process message:', error);
+      this.logger.error('Failed to handle media:', error);
     }
   }
 
@@ -142,62 +166,14 @@ export class DiscordService implements OnModuleInit {
       const channel = await this.client.channels.fetch(pair.discordChannel.channelId);
       if (!(channel instanceof TextChannel)) return;
 
-      const content = `${message.authorName}: ${message.content}`;
-
       if (message.attachments) {
-        const attachments = JSON.parse(message.attachments);
-        await this.sendMediaToDiscord(channel, content, attachments);
-      } else {
-        await channel.send(content);
+        await this.handleIncomingMedia(channel, message);
+      } else if (message.content?.trim()) {
+        await channel.send(message.content);
       }
     } catch (error) {
       this.logger.error('Failed to send message:', error);
     }
-  }
-
-  private async sendMediaToDiscord(channel: TextChannel, content: string, attachments: any) {
-    try {
-      for (const attachment of Array.isArray(attachments) ? attachments : [attachments]) {
-        const response = await axios.get(attachment.url, { responseType: 'arraybuffer' });
-        const buffer = Buffer.from(response.data);
-
-        await channel.send({
-          content,
-          files: [{
-            attachment: buffer,
-            name: attachment.name || `file.${this.getExtensionFromType(attachment.contentType)}`
-          }]
-        });
-      }
-    } catch (error) {
-      this.logger.error('Failed to send media:', error);
-    }
-  }
-
-  private getContentType(filename: string): string {
-    const ext = filename.split('.').pop()?.toLowerCase();
-    const mimeTypes = {
-      png: 'image/png',
-      jpg: 'image/jpeg',
-      jpeg: 'image/jpeg',
-      gif: 'image/gif',
-      webp: 'image/webp',
-      mp4: 'video/mp4',
-      mov: 'video/quicktime'
-    };
-    return mimeTypes[ext] || 'application/octet-stream';
-  }
-
-  private getExtensionFromType(contentType: string): string {
-    const types = {
-      'image/png': 'png',
-      'image/jpeg': 'jpg',
-      'image/gif': 'gif',
-      'image/webp': 'webp',
-      'video/mp4': 'mp4',
-      'video/quicktime': 'mov'
-    };
-    return types[contentType] || 'bin';
   }
 
   private async getChannelPair(message: any) {
@@ -212,5 +188,25 @@ export class DiscordService implements OnModuleInit {
     });
 
     return discordChannel ? { telegramChannel, discordChannel } : null;
+  }
+
+  private async handleIncomingMedia(channel: TextChannel, message: any) {
+    try {
+      const attachment = JSON.parse(message.attachments);
+      if (!attachment.url) return;
+
+      const response = await axios.get(attachment.url, { responseType: 'arraybuffer' });
+      const buffer = Buffer.from(response.data);
+      
+      await channel.send({
+        content: message.content || undefined,
+        files: [{
+          attachment: buffer,
+          name: attachment.name || 'media'
+        }]
+      });
+    } catch (error) {
+      this.logger.error('Failed to handle incoming media:', error);
+    }
   }
 }

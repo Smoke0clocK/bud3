@@ -12,7 +12,6 @@ import axios from 'axios';
 export class TelegramService implements OnModuleInit {
   private bot: Telegraf;
   private logger = new Logger('TelegramService');
-  private messageCache = new Map<string, { authorName: string, content: string }>();
 
   constructor(
     private prisma: PrismaService,
@@ -26,10 +25,8 @@ export class TelegramService implements OnModuleInit {
     try {
       this.logger.log('Initializing Telegram bot...');
       
-      // Handle all message types
       this.bot.on(['text', 'sticker', 'animation', 'photo', 'video', 'document'], (ctx) => this.handleMessage(ctx));
       
-      // Handle Discord messages
       this.broker.subscribe(async (message) => {
         if (message.platform === 'discord') {
           await this.handleDiscordMessage(message);
@@ -51,60 +48,51 @@ export class TelegramService implements OnModuleInit {
       const pair = await this.getChannelPair(message);
       if (!pair) return;
 
+      // Create options for sending message
       const options: any = {
         parse_mode: 'HTML',
         disable_web_page_preview: true
       };
 
-      // Handle reply data
-      if (message.replyData) {
-        const replyInfo = JSON.parse(message.replyData);
+      // If message is a reply, handle reply references
+      if (message.replyToId) {
         const repliedMessage = await this.prisma.message.findFirst({
           where: {
-            platform: 'telegram',
-            channelId: pair.telegramChannel.id
+            platformId: message.replyToId,
+            platform: 'telegram'
           }
         });
-
         if (repliedMessage) {
           options.reply_to_message_id = parseInt(repliedMessage.platformId);
         }
       }
 
-      // Create caption/message with author's name
-      let content = message.content;
-      if (!content.startsWith(message.authorName)) {
-        content = `${message.authorName}: ${content}`;
-      }
-
-      // Handle avatar if provided
+      // If there's an avatar URL, download and use it
+      let photoBuffer;
       if (message.authorAvatar) {
         try {
-          const response = await axios.get(message.authorAvatar, { responseType: 'arraybuffer' });
-          // Store avatar for potential future use
-          this.messageCache.set(message.authorName, {
-            authorName: message.authorName,
-            content: message.content
-          });
+          const avatarResponse = await axios.get(message.authorAvatar, { responseType: 'arraybuffer' });
+          photoBuffer = Buffer.from(avatarResponse.data);
         } catch (error) {
           this.logger.error('Failed to fetch avatar:', error);
         }
       }
 
-      // Handle media attachments
+      // Format the message with proper display name
+      const formattedContent = `<b>${message.authorName}</b>: ${message.content}`;
+
       if (message.attachments) {
-        const attachments = JSON.parse(message.attachments);
         await this.handleDiscordMedia(
           pair.telegramChannel.channelId,
-          content,
-          attachments,
-          options
+          formattedContent,
+          message.attachments,
+          options,
+          photoBuffer
         );
       } else {
-        // Send text message
         await this.bot.telegram.sendMessage(
           pair.telegramChannel.channelId,
-          content,
+          formattedContent,
           options
         );
       }
@@ -113,36 +101,38 @@ export class TelegramService implements OnModuleInit {
     }
   }
 
-  private async handleDiscordMedia(chatId: string, content: string, attachments: any, options: any) {
+  private async handleDiscordMedia(chatId: string, content: string, attachments: string, options: any, avatarBuffer?: Buffer) {
     try {
-      const mediaItems = Array.isArray(attachments) ? attachments : [attachments];
+      const attachment = JSON.parse(attachments);
+      
+      const response = await axios.get(attachment.url, { responseType: 'arraybuffer' });
+      const buffer = Buffer.from(response.data);
 
-      for (const item of mediaItems) {
-        const response = await axios.get(item.url, { responseType: 'arraybuffer' });
-        const buffer = Buffer.from(response.data);
-        const mediaOptions = { ...options, caption: content };
+      const mediaOptions = {
+        ...options,
+        caption: content,
+      };
 
-        if (item.isSticker) {
-          if (item.isAnimated) {
-            await this.bot.telegram.sendAnimation(chatId, { source: buffer }, mediaOptions);
-          } else {
-            await this.bot.telegram.sendSticker(chatId, { source: buffer });
-            // Send caption separately since stickers can't have captions
-            await this.bot.telegram.sendMessage(chatId, content, options);
-          }
-        } else if (item.contentType.startsWith('image/gif')) {
+      if (attachment.isSticker) {
+        if (attachment.isAnimated) {
           await this.bot.telegram.sendAnimation(chatId, { source: buffer }, mediaOptions);
-        } else if (item.contentType.startsWith('image/')) {
-          await this.bot.telegram.sendPhoto(chatId, { source: buffer }, mediaOptions);
-        } else if (item.contentType.startsWith('video/')) {
-          await this.bot.telegram.sendVideo(chatId, { source: buffer }, mediaOptions);
         } else {
-          await this.bot.telegram.sendDocument(
-            chatId,
-            { source: buffer, filename: item.name || 'file' },
-            mediaOptions
-          );
+          await this.bot.telegram.sendSticker(chatId, { source: buffer });
+          // Send caption as separate message since stickers can't have captions
+          await this.bot.telegram.sendMessage(chatId, content, options);
         }
+      } else if (attachment.contentType?.startsWith('image/gif')) {
+        await this.bot.telegram.sendAnimation(chatId, { source: buffer }, mediaOptions);
+      } else if (attachment.contentType?.startsWith('image/')) {
+        await this.bot.telegram.sendPhoto(chatId, { source: buffer }, mediaOptions);
+      } else if (attachment.contentType?.startsWith('video/')) {
+        await this.bot.telegram.sendVideo(chatId, { source: buffer }, mediaOptions);
+      } else {
+        await this.bot.telegram.sendDocument(
+          chatId,
+          { source: buffer, filename: attachment.name || 'file' },
+          mediaOptions
+        );
       }
     } catch (error) {
       this.logger.error('Failed to handle Discord media:', error);
@@ -205,6 +195,8 @@ export class TelegramService implements OnModuleInit {
 
       if (!channel) return;
 
+      const authorName = ctx.from.username || ctx.from.first_name || 'Unknown';
+
       // Store message
       await this.prisma.message.create({
         data: {
@@ -213,7 +205,7 @@ export class TelegramService implements OnModuleInit {
           content,
           channelId: channel.id,
           authorId: ctx.from.id.toString(),
-          authorName: ctx.from.username || ctx.from.first_name || 'Unknown',
+          authorName,
           threadId: null,
           replyToId: ('reply_to_message' in ctx.message) ? 
             ctx.message.reply_to_message?.message_id?.toString() : null,
@@ -221,24 +213,15 @@ export class TelegramService implements OnModuleInit {
         }
       });
 
-      // Prepare reply data if message is a reply
-      let replyData = null;
-      if ('reply_to_message' in ctx.message && ctx.message.reply_to_message) {
-        replyData = {
-          authorName: ctx.message.reply_to_message.from.username || ctx.message.reply_to_message.from.first_name,
-          content: 'text' in ctx.message.reply_to_message ? ctx.message.reply_to_message.text : '[Media Message]',
-          messageId: ctx.message.reply_to_message.message_id
-        };
-      }
-
       // Publish to broker
       this.broker.publish({
         content,
         platform: 'telegram',
         channelId: ctx.chat.id.toString(),
-        authorName: ctx.from.username || ctx.from.first_name || 'Unknown',
+        authorName,
         attachments,
-        replyData: replyData ? JSON.stringify(replyData) : null
+        replyToId: ('reply_to_message' in ctx.message) ? 
+          ctx.message.reply_to_message?.message_id?.toString() : null
       });
     } catch (error) {
       this.logger.error('Error handling Telegram message:', error);

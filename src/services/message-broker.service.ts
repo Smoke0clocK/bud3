@@ -6,8 +6,10 @@ export interface BridgeMessage {
   platform: 'discord' | 'telegram';
   channelId: string;
   authorName: string;
+  authorAvatar?: string;  // Make avatar optional
   attachments?: string | null;
-  replyToId?: string | null;  // Add this
+  replyToId?: string | null;
+  replyData?: string | null;
 }
 
 @Injectable()

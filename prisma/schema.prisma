@@ -29,10 +29,12 @@ model Message {
   channel     Channel   @relation(fields: [channelId], references: [id])
   authorId    String
   authorName  String
+  authorAvatar String?
   createdAt   DateTime  @default(now())
   editedAt    DateTime?
   threadId    String?
   replyToId   String?
+  replyData   String?
   attachments Json?     // store URLs and metadata
 
   @@unique([platform, platformId])
