@@ -1,0 +1,39 @@
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildPayload),
+      }
+    );
+
+    if (!buildResponse.ok) {
+      throw new Error(
+        `Failed to build transaction: ${await buildResponse.text()}`
+      );
+    }
+
+    const buildData = await buildResponse.json();
+    const keyPair = this.ec.keyFromPrivate(privateKey);
+    const signature = keyPair.sign(buildData.transactionHash).toDER("hex");
+
+    const submitPayload = {
+      transaction: buildData.transaction,
+      signatures: [signature],
+    };
+
+    const submitResponse = await fetch(
+      "https://node.testnet.alephium.org/transactions/send",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(submitPayload),
+      }
+    );
+
+    if (!submitResponse.ok) {
+      throw new Error(
+        `Failed to send transaction: ${await submitResponse.text()}`
+      );
+    }
+
+    const submitData = await submitResponse.json();
+    return submitData.transactionHash;
+  }
+}
