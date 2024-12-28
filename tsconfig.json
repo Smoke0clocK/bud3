@@ -1,14 +1,9 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
-    "module": "commonjs",
-    "strict": true,
-    "esModuleInterop": true,
-    "moduleResolution": "node",
-    "resolveJsonModule": true,
-    "skipLibCheck": true,
-    "outDir": "dist"
-  },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules"]
+    "module": "ESNext", // Use ESNext for ESM
+    "moduleResolution": "NodeNext", // Use NodeNext for module resolution
+    "target": "ES2022", // Use a modern target
+    "esModuleInterop": true, // Enable ES module interop
+    "allowSyntheticDefaultImports": true // Allow synthetic default imports
+  }
 }
